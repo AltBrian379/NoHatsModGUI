@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.pytest_cache/
+build/
+dist/
+*.spec
+
+# nhcustom2 and game files are downloaded separately, not part of the build
+nhcustom2_windows/
+nhcustom2_windows.zip
+database.csv
+*.vpk
