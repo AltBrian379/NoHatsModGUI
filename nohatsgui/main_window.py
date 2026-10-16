@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from pathlib import Path
+from typing import Callable
 
-from PySide6.QtCore import QFileSystemWatcher, QProcess, Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QFileSystemWatcher, QProcess, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QSplitter, QVBoxLayout, QWidget,
@@ -18,9 +20,42 @@ from .config import KEEP, REMOVE, generate, is_generated, parse_generated
 from .database import Hat, Section, build_sections, load_database
 from .hat_tree import HatTree
 from .paths import TOOL_EXE_NAME, TOOL_FOLDER_NAME, ToolPaths, app_dir, find_database, find_tool
+from .vpk import build_custom, decompile, find_input_vpk, has_decompiled
 
 SEARCH_DELAY_MS = 150
 MAX_TOOL_PATH = 120
+
+
+CUSTOM_NAME = "no-hats-bgum-custom"
+
+
+class TaskThread(QThread):
+    """Runs work(progress) off the UI thread; read result or error once finished."""
+
+    progress = Signal(int, int)
+
+    def __init__(self, label: str, work: Callable[[Callable[[int, int], None]], object],
+                 on_success: Callable[[object], None], parent=None):
+        super().__init__(parent)
+        self.label = label
+        self.work = work
+        self.on_success = on_success
+        self.result: object = None
+        self.error: str | None = None
+
+    def run(self) -> None:
+        last_percent = -1
+
+        def report(done: int, total: int) -> None:
+            nonlocal last_percent
+            percent = done * 100 // total
+            if percent != last_percent:
+                last_percent = percent
+                self.progress.emit(done, total)
+        try:
+            self.result = self.work(report)
+        except (OSError, ValueError) as error:
+            self.error = str(error)
 
 
 class MainWindow(QMainWindow):
@@ -34,6 +69,12 @@ class MainWindow(QMainWindow):
         self.hats: list[Hat] = []
         self.sections: list[Section] = []
         self.process: QProcess | None = None
+        self.task: TaskThread | None = None
+        self.task_progress = ""
+        self.task_started = 0.0
+        # Ticks the elapsed time on the task's log line so it never looks frozen.
+        self.task_timer = QTimer(self, interval=1000)
+        self.task_timer.timeout.connect(self._show_task_status)
 
         self._build_ui()
 
@@ -199,7 +240,7 @@ class MainWindow(QMainWindow):
         self.count_label.setText(f"{len(self.tree.selected_ids())} of {len(self.hats)} selected")
 
     def _update_buttons(self) -> None:
-        running = self.process is not None
+        running = self._busy()
         has_tool = self.tool is not None
         self.save_button.setEnabled(has_tool and bool(self.hats))
         self.run_button.setEnabled(has_tool and bool(self.hats) and not running)
@@ -244,14 +285,12 @@ class MainWindow(QMainWindow):
     # ---- running nhcustom2 -------------------------------------------
 
     def run_tool(self) -> None:
-        if self.tool is None or self.database is None or self.process is not None:
+        if self.tool is None or self.database is None or self._busy():
             return
         tool = self.tool
-        if not (tool.input / "models").is_dir():
-            QMessageBox.warning(
-                self, "No input mod",
-                f"Put a decompiled no-hats-bgum mod in\n{tool.input}\n\n"
-                "It should contain a \"models\" folder.")
+        if not has_decompiled(tool.input):
+            # Decompile first (or ask for the VPK), then come back here.
+            self._check_input(then_run=True)
             return
         if not self.save_config():
             return
@@ -290,13 +329,14 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(data.decode("utf-8", errors="replace").rstrip("\n"))
 
     def _on_finished(self, exit_code: int, _status) -> None:
-        if exit_code == 0:
-            self.log.appendPlainText(f"Done. Output is in {self.tool.output}\n")
-        else:
-            self.log.appendPlainText(f"nhcustom2 exited with code {exit_code}.\n")
         self.process.deleteLater()
         self.process = None
         self._update_buttons()
+        if exit_code != 0:
+            self.log.appendPlainText(f"nhcustom2 exited with code {exit_code}.\n")
+            return
+        self.log.appendPlainText(f"nhcustom2 finished. Output is in {self.tool.output}")
+        self.build_custom_vpk(self.tool.output)
 
     def _on_error(self, error) -> None:
         if error == QProcess.FailedToStart:
@@ -304,6 +344,90 @@ class MainWindow(QMainWindow):
             self.process.deleteLater()
             self.process = None
             self._update_buttons()
+
+    # ---- decompiling and packing VPKs ---------------------------------
+
+    def _busy(self) -> bool:
+        return self.process is not None or self.task is not None
+
+    def _check_input(self, then_run: bool = False) -> None:
+        """Decompile the VPK in nhcustom2's input (or ask for one); nothing to do if already decompiled."""
+        if self.tool is None or self._busy() or has_decompiled(self.tool.input):
+            return
+        vpk = find_input_vpk(self.tool.input)
+        if vpk is None:
+            self.tool.input.mkdir(exist_ok=True)
+            box = QMessageBox(QMessageBox.Information, "No-hats-bgum needed",
+                              f"Place the no_hats_bgum.vpk file in\n{self.tool.input}\n\n"
+                              f"{APP_NAME} will decompile it for nhcustom2.", parent=self)
+            open_button = box.addButton("Open input folder", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Close)
+            box.exec()
+            if box.clickedButton() is open_button:
+                os.startfile(self.tool.input)
+            return
+        self.decompile(vpk, then_run)
+
+    def decompile(self, vpk: Path, then_run: bool = False) -> None:
+        def done(count: int) -> None:
+            self.log.appendPlainText(f"Decompiled {count} files into {vpk.parent}\n")
+            if then_run:
+                self.run_tool()
+        self._start_task(f"Decompiling {vpk.name}", lambda report: decompile(vpk, report), done)
+
+    def build_custom_vpk(self, output: Path) -> None:
+        """Move output/models down into output/no-hats-bgum-custom, then pack that folder into a VPK."""
+        def done(result: tuple[Path, int]) -> None:
+            vpk, count = result
+            self.log.appendPlainText(f"Packed {count} files into {vpk}\n"
+                                     "Drag it into Team Fortress 2\\tf\\custom to use it.\n")
+        self._start_task(f"Packing {CUSTOM_NAME}.vpk",
+                         lambda report: build_custom(output, CUSTOM_NAME, report), done)
+
+    def _start_task(self, label: str, work, on_success) -> None:
+        self.task = TaskThread(label, work, on_success, self)
+        self.task.progress.connect(self._on_task_progress)
+        self.task.finished.connect(self._on_task_finished)
+        self.task_progress = "starting"
+        self.task_started = time.monotonic()
+        self.log.appendPlainText("")
+        self._show_task_status()
+        self.task_timer.start()
+        self.task.start()
+        self._update_buttons()
+
+    def _on_task_progress(self, done: int, total: int) -> None:
+        if done == total:
+            self.task_progress = f"{total:,} files, finishing up"
+        else:
+            self.task_progress = f"{done * 100 // total}% ({done:,} of {total:,} files)"
+        self._show_task_status()
+
+    def _show_task_status(self) -> None:
+        """Rewrite the task's line (the log's last line) in place."""
+        if self.task is None:
+            return
+        elapsed = int(time.monotonic() - self.task_started)
+        cursor = self.log.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
+        cursor.insertText(f"{self.task.label}… {self.task_progress}, {elapsed}s")
+
+    def _on_task_finished(self) -> None:
+        self._show_task_status()
+        self.task_timer.stop()
+        task, self.task = self.task, None
+        task.deleteLater()
+        self._update_buttons()
+        if task.error is not None:
+            self.log.appendPlainText(f"{task.label} failed: {task.error}\n")
+        else:
+            task.on_success(task.result)
+
+    def closeEvent(self, event) -> None:
+        if self.task is not None:
+            self.task.wait()  # never leave half-written files behind
+        super().closeEvent(event)
 
     def open_output(self) -> None:
         if self.tool is not None and self.tool.output.is_dir():
